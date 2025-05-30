@@ -177,3 +177,5 @@ cython_debug/
 # custom
 weights/**
 !weights/.gitkeep
+outputs/
+results/

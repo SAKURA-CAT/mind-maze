@@ -25,54 +25,98 @@ from transformers.generation.utils import (
     GenerationConfig,
     GenerateNonBeamOutput,
 )
-from method import methods
 
 if TYPE_CHECKING:
     from transformers.generation.streamers import BaseStreamer
 
 
-class MMQwen3Config(PretrainedConfig):
-    model_type = "mm_qwen3"
+class BlockingQwen3Config(PretrainedConfig):
+    model_type = "blocking_qwen3"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
 
-class MMQwen3ForCausalLM(Qwen3ForCausalLM):
+class BlockingQwen3ForCausalLM(Qwen3ForCausalLM):
     """
     自定义 Qwen3 类型，添加 thinking 模式的文案混淆功能
     暂时只支持 batch_size=1 的情况
     """
 
-    config_class = MMQwen3Config
+    config_class = BlockingQwen3Config
     THINK_START_ID = 151667
     THINK_END_ID = 151668
 
-    def __init__(self, config: MMQwen3Config):
+    def __init__(self, config: BlockingQwen3Config):
         super().__init__(config)
-        self.mm = config.mm
+        self.blocking = config.blocking
         self.obfuscate = False
+        self.intensity = 0.2
+
+    def adaptive_rearrange(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        根据强度参数动态重组二维张量
+
+        参数：
+        tensor: 形状为 [1, seq_len] 的二维张量
+        intensity: 重组强度 (0=不重组, 1=完全打乱)
+
+        返回：
+        重组后的张量（保持原始形状）
+        """
+        assert 0 <= self.intensity <= 1, "强度参数必须在0-1之间"
+        assert tensor.dim() == 2 and tensor.size(0) == 1, "输入必须是形状[1, seq_len]"
+
+        seq_len = tensor.size(1)
+        if seq_len <= 1 or self.intensity == 0:
+            return tensor.clone()
+
+        # 计算切分块数（强度越大，块数越多）
+        min_chunks = 1
+        max_chunks = seq_len
+        num_chunks = max(min_chunks, min(max_chunks, int(1 / self.intensity)))
+
+        # 计算每个块的平均长度
+        chunk_size = max(1, seq_len // num_chunks)
+
+        # 切分张量
+        chunks = []
+        for i in range(0, seq_len, chunk_size):
+            chunk = tensor[:, i : i + chunk_size]
+            if chunk.size(1) > 0:  # 跳过空块
+                chunks.append(chunk)
+
+        # 随机重排块顺序
+        if len(chunks) > 1:
+            perm = torch.randperm(len(chunks))
+            chunks = [chunks[i] for i in perm]
+
+        # 合并结果
+        return torch.cat(chunks, dim=1)
 
     def generate(self, **kwargs):
+        self.obfuscate = False
         generated_ids = super().generate(**kwargs)
         output_ids = generated_ids[0]
         input_ids = output_ids.unsqueeze(0)
         # -------------------------------- Confusion begins ----------------------------------
         # 1. get think start and end indices
-        think_start_index = int(
-            (input_ids == self.THINK_START_ID).nonzero(as_tuple=True)[1]
-        )
-        think_end_index = int(
-            (input_ids == self.THINK_END_ID).nonzero(as_tuple=True)[1]
-        )
+        think_start_index = (input_ids == self.THINK_START_ID).nonzero(as_tuple=True)[1]
+        think_end_index = (input_ids == self.THINK_END_ID).nonzero(as_tuple=True)[1]
+        if think_start_index.numel() == 0 or think_end_index.numel() == 0:
+            # If no think start or end indices are found, return the original input_ids
+            return generated_ids
+
+        start_index = int(think_start_index)
+        end_index = int(think_end_index)
         # 2. if think start and end indices are found, confuse the content between them
-        if think_start_index != -1 and think_end_index != -1:
+        if start_index != -1 and end_index != -1:
             # 3. get the content between think start and end indices
-            think_content = input_ids[:, think_start_index + 1 : think_end_index]
+            think_content = input_ids[:, start_index + 1 : end_index]
             # 4. confuse the content by reversing it
-            confused_content = methods["adaptive_rearrange"](think_content, self.mm)
+            confused_content = self.adaptive_rearrange(think_content)
             # 5. replace the original content with the confused content
-            input_ids[:, think_start_index + 1 : think_end_index] = confused_content
+            input_ids[:, start_index + 1 : end_index] = confused_content
         kwargs["input_ids"] = input_ids
         kwargs["attention_mask"] = torch.ones_like(input_ids)
         # ---------------------------------- Confusion ends ----------------------------------
@@ -286,18 +330,21 @@ class MMQwen3ForCausalLM(Qwen3ForCausalLM):
 
 
 # 动态注册
-AutoConfig.register("mm_qwen3", MMQwen3Config)
-AutoTokenizer.register(MMQwen3Config, AutoTokenizer)
-AutoModelForCausalLM.register(MMQwen3Config, MMQwen3ForCausalLM)
+AutoConfig.register("blocking_qwen3", BlockingQwen3Config)
+AutoTokenizer.register(BlockingQwen3Config, AutoTokenizer)
+AutoModelForCausalLM.register(BlockingQwen3Config, BlockingQwen3ForCausalLM)
 
-MODE_NAME = "./weights/MMQwen3-4B"
+MODE_NAME = "./weights/BlockingQwen3-4B"
+
 
 if __name__ == "__main__":
-
     # load the tokenizer and the model
     tokenizer = AutoTokenizer.from_pretrained(MODE_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        MODE_NAME, torch_dtype="auto", device_map="auto", trust_remote_code=True
+        MODE_NAME,
+        torch_dtype="auto",
+        device_map="auto",
+        trust_remote_code=True,
     )
 
     # prepare the model input
